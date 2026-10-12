@@ -35,4 +35,22 @@ Bringing CAD drawings into ArcGIS Pro often puts them in the wrong place. The us
 1. Download `CAD_to_GIS.pyt` from this repository.
 2. In ArcGIS Pro: **Catalog** pane → right-click **Toolboxes** → **Add Toolbox** → select `CAD_to_GIS.pyt`.
 3. The tool appears under the toolbox. You only need to do this once per project, or add it to your favorites to use it everywhere.
+
+---
+
+ 
+## Parameters
+ 
+| Parameter | Description | Default |
+|---|---|---|
+| CAD folder | Folder holding the drawings. Subfolders are included, except `_GIS_ready`. After you pick a folder, the form shows how many CAD files it found (for example "Found 8 CAD file(s): 8 .dwg, in 2 folder(s)"), and blocks the run if there are none. The note appears with Pro's yellow warning icon; it's information, not a problem. | (none, required) |
+| Reference layer | A layer in the current map that is known to be in the right place, such as borings. If features are selected, only the selected ones are used. | (none, required) |
+| Mode | `Check only` or `Check and fix` | `Check only` |
+| Write fixes to | `Copies in _GIS_ready subfolder` or `Originals`. Only active in fix mode. | Copies |
+| Check each CAD layer | Also checks each CAD layer separately. This finds parts of a combined drawing that land somewhere else. | On |
+| File types | `.dwg`, `.dxf`, `.dgn` | All three |
+| Open the report in my browser when done | Opens the HTML report automatically at the end of the run | On |
+| Also save the results as CSV | Saves CSV copies of the results next to the HTML report, for Excel | Off |
+| Extra coordinate systems | Other systems to try, such as the project ground system when the reference layer is in State Plane. Pick them in Pro's coordinate system picker, which can also import one from a layer or a `.prj`. | None |
+ 
 ---
