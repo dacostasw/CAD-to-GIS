@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-CAD to GIS (v0.1.5) - ArcGIS Pro Python toolbox.
+CAD to GIS (v0.1.10) - ArcGIS Pro Python toolbox.
+Date: 2026-10-12
+Designed for ArcGIS Pro 3.0+ (Python 3.9+). See README.md for installation and usage.
 
 Checks the CAD drawings in a folder against a reference layer that is known to
 be in the right place (for example, borings). Reports which coordinate system
@@ -10,8 +12,8 @@ drawing lands in the right place.
 Drawings are never edited. Only .prj side files are written. See README.md.
 Runs in ArcGIS Pro's default Python environment (arcpy + standard library).
 """
-import csv
 import datetime
+import getpass
 import html
 import math
 import os
@@ -21,7 +23,7 @@ import time
 
 import arcpy
 
-VERSION = "0.1.5"
+VERSION = "0.1.10"
 CAD_EXTENSIONS = [".dwg", ".dxf", ".dgn"]
 OUTPUT_SUBFOLDER = "_GIS_ready"
 
@@ -45,7 +47,10 @@ STRAY_RATIO = 20.0
 MODE_CHECK = "Check only"
 MODE_FIX = "Check and fix"
 WRITE_COPIES = "Copies in _GIS_ready subfolder"
-WRITE_ORIGINALS = "Originals"
+WRITE_ORIGINALS = "Original folders (adds a .prj next to each drawing)"
+CHANGE_LOG = "_CAD_to_GIS_changes.txt"
+DONE_OPEN_REPORT = "Open the report in my browser"
+DONE_ADD_TO_MAP = "Add ready drawings to the current map"
 
 
 # --------------------------------------------------------------------------
@@ -89,8 +94,8 @@ class CheckCADCoordinates:
             displayName="Write fixes to", name="write_to", datatype="GPString",
             parameterType="Optional", direction="Input")
         write_to.filter.type = "ValueList"
-        write_to.filter.list = [WRITE_COPIES, WRITE_ORIGINALS]
-        write_to.value = WRITE_COPIES
+        write_to.filter.list = [WRITE_ORIGINALS, WRITE_COPIES]
+        write_to.value = WRITE_ORIGINALS
         write_to.enabled = False
 
         layers = arcpy.Parameter(
@@ -111,46 +116,34 @@ class CheckCADCoordinates:
             name="extra_systems", datatype="GPSpatialReference",
             parameterType="Optional", direction="Input", multiValue=True)
 
-        open_report = arcpy.Parameter(
-            displayName="Open the report in my browser when done",
-            name="open_report", datatype="GPBoolean",
-            parameterType="Optional", direction="Input")
-        open_report.value = True
-
-        save_csv = arcpy.Parameter(
-            displayName="Also save the results as CSV (for Excel)",
-            name="save_csv", datatype="GPBoolean",
-            parameterType="Optional", direction="Input")
-        save_csv.value = False
+        when_done = arcpy.Parameter(
+            displayName="When done", name="when_done", datatype="GPString",
+            parameterType="Optional", direction="Input", multiValue=True)
+        when_done.filter.type = "ValueList"
+        when_done.filter.list = [DONE_OPEN_REPORT, DONE_ADD_TO_MAP]
+        when_done.values = [DONE_OPEN_REPORT]
 
         report = arcpy.Parameter(
             displayName="Report", name="report", datatype="DEFile",
             parameterType="Derived", direction="Output")
 
-        return [folder, ref, mode, write_to, layers, types, extra,
-                open_report, save_csv, report]
+        return [folder, ref, mode, write_to, layers, types, extra, when_done, report]
 
     def updateParameters(self, parameters):
         parameters[3].enabled = parameters[2].valueAsText == MODE_FIX
         return
 
     def updateMessages(self, parameters):
-        # Show how many CAD files the chosen folder holds, before running
+        # Block the run only when the folder holds no CAD files at all
         folder_p = parameters[0]
         if folder_p.value and not folder_p.hasError():
             folder = folder_p.valueAsText
             exts = [e.lower() for e in (parameters[5].values or CAD_EXTENSIONS)]
             if os.path.isdir(folder):
-                counts, n_folders, truncated = count_cad_files(folder, exts)
-                total = sum(counts.values())
-                if total == 0:
+                counts, _, _ = count_cad_files(folder, exts)
+                if sum(counts.values()) == 0:
                     folder_p.setErrorMessage(
                         f"No {', '.join(exts)} files in this folder or its subfolders.")
-                else:
-                    found = ", ".join(f"{n} {e}" for e, n in counts.items() if n)
-                    more = " (large folder: counted the first part only)" if truncated else ""
-                    folder_p.setWarningMessage(
-                        f"Found {total} CAD file(s): {found}, in {n_folders} folder(s){more}.")
         return
 
     def execute(self, parameters, messages):
@@ -167,17 +160,17 @@ class CheckCADCoordinates:
             arcpy.AddError("The reference layer has no coordinate system defined. "
                            "Use a layer whose coordinate system is known.")
             return
+        files = find_cad_files(cad_folder, exts)
+        if not files:
+            arcpy.AddError(f"No {', '.join(exts)} files found in {os.path.basename(cad_folder)}.")
+            return
+
         n_ref = int(arcpy.management.GetCount(ref_layer)[0])
         candidates = build_candidates(ref_sr, parse_extra_systems(parameters[6]))
-        print_header(mode, ref_layer, n_ref, ref_sr, candidates)
+        print_header(mode, cad_folder, files, ref_layer, n_ref, ref_sr, candidates)
         boxes = BoxCache(ref_layer)
         if boxes.get(ref_sr) is None:
             arcpy.AddError(f"Could not use the reference layer: {boxes.why(ref_sr)}.")
-            return
-
-        files = find_cad_files(cad_folder, exts)
-        if not files:
-            arcpy.AddWarning(f"No {', '.join(exts)} files found in {cad_folder}.")
             return
 
         # Pass 1: read every drawing once
@@ -204,22 +197,41 @@ class CheckCADCoordinates:
                 layer_rows.extend(classify(res, loc, candidates, boxes, check_layers))
             results.append(res)
 
+        if mode == MODE_CHECK or write_to == WRITE_COPIES:
+            for res in results:
+                mark_existing_fix(res, cad_folder)
+
         if mode == MODE_FIX:
             arcpy.SetProgressorLabel("Applying fixes...")
             for res in results:
                 apply_fix(res, cad_folder, write_to)
+            write_change_log(results, cad_folder)
+
+        when_done = list(parameters[7].values or [])
+        folder_name = os.path.basename(cad_folder.rstrip("\\/"))
+        n_ready = sum(1 for r in results if r["status"] in ("OK", "FIXED"))
+        # The map is filled after the report, so the report doesn't wait for it
+        adding = ({"count": n_ready, "group": f"CAD to GIS - {folder_name}"}
+                  if DONE_ADD_TO_MAP in when_done and n_ready else None)
 
         seconds = time.time() - t0
-        context = {"mode": mode, "write_to": write_to, "ref_name": os.path.basename(ref_layer),
+        context = {"mode": mode, "write_to": write_to, "added": adding,
+                   "ref_name": os.path.basename(ref_layer),
                    "n_ref": n_ref, "ref_sr": ref_sr, "candidates": candidates,
                    "cad_folder": os.path.basename(cad_folder.rstrip("\\/")), "seconds": seconds}
         report_path = write_html_report(results, layer_rows, context)
-        if parameters[8].value:
-            write_csv_reports(results, layer_rows, check_layers, report_path)
-        print_summary(results, mode, write_to, report_path, seconds)
-        if parameters[7].value:
+        print_summary(results, mode, write_to, report_path, seconds, adding)
+        parameters[8].value = report_path
+        if DONE_OPEN_REPORT in when_done:
             open_in_browser(report_path)
-        parameters[9].value = report_path
+
+        if adding:
+            t1 = time.time()
+            arcpy.SetProgressorLabel("Adding ready drawings to the map...")
+            arcpy.AddMessage("")
+            arcpy.AddMessage(f"Adding {n_ready} ready drawing(s) to the map. The report is already open.")
+            add_ready_to_map(results, folder_name)
+            arcpy.AddMessage(f"Map time: {time.time() - t1:.1f} s")
         arcpy.ResetProgressor()
         return
 
@@ -293,6 +305,21 @@ def compare_sr(cad_sr, ref_sr):
             return "same", "same as reference"
         return "same", f"same parameters as reference, different name ({cad_sr.name})"
     return "different", "different from reference: " + "; ".join(diffs)
+
+
+def same_grid(a, b):
+    """True when two systems differ at most in datum (e.g. NAD83 vs NAD83(2011))."""
+    pa, pb = sr_props(a), sr_props(b)
+    for k in pa:
+        if k == "datum":
+            continue
+        va, vb = pa[k], pb[k]
+        if isinstance(va, (int, float)) and isinstance(vb, (int, float)):
+            if not math.isclose(va, vb, rel_tol=1e-9, abs_tol=1e-9):
+                return False
+        elif va != vb:
+            return False
+    return True
 
 
 def describe_sr(sr):
@@ -480,7 +507,9 @@ def read_file(path, root, check_layers):
            "crs_check": "", "crs_vs_reference": "", "suggested": "",
            "suggested_sr": None, "features": 0, "cad_layers": "",
            "offsite_layers": "", "review_kind": "", "likely_local": False,
-           "stray": False, "fix": "", "output": ""}
+           "stray": False, "already": False, "fix": "", "output": "",
+           "location": os.path.dirname(os.path.relpath(path, root)) or "(top folder)",
+           "backup": ""}
     try:
         existing_sr = arcpy.Describe(path).spatialReference
         has_prj = os.path.exists(prj_path(path))
@@ -575,6 +604,18 @@ def classify(res, loc, candidates, boxes, check_layers):
                 res["detail"] = f"Existing .prj ({res['existing_prj']}) lands off-site; fits {label}"
             else:
                 res["detail"] = f"No .prj; fits {label}"
+        elif len(fits) > 1 and all(same_grid(fits[0][1], sr) for _, sr in fits[1:]):
+            # Same grid, different NAD83 version (about 1 m apart). This check
+            # can't tell them apart, so use the first one: the reference's
+            # system when it fits.
+            label, sr = fits[0]
+            chosen = sr
+            others = "; ".join(l for l, _ in fits[1:])
+            prefix = f"Existing .prj ({res['existing_prj']}) lands off-site; fits" if has_prj else "No .prj; fits"
+            res.update(status="FIX", suggested=label, suggested_sr=sr, review_kind="datum",
+                       detail=f"{prefix} {label}",
+                       diagnosis=(f"Also fits {others}: same grid, different NAD83 version "
+                                  f"(about 1 m apart), which this check can't tell apart."))
         elif len(fits) > 1:
             res.update(status="REVIEW", review_kind="ambiguous",
                        detail="Fits more than one system: " + "; ".join(l for l, _ in fits))
@@ -615,92 +656,276 @@ def learn_systems(reads, candidates, boxes):
     return learned
 
 
-def action_items(results, mode, write_to):
-    """(headline, [action items]) shared by the log and the HTML report."""
+def action_items(results, mode, write_to, added=None):
+    """(headline, next action, [(issue, solution), ...]), shared by the log and
+    the HTML report. The next action is the one thing to do first."""
     n = len(results)
     count = lambda pred: sum(1 for r in results if pred(r))
-    applied = count(lambda r: r["fix"].startswith("Applied"))
-    ready = count(lambda r: r["status"] == "OK") + applied
+    applied = count(lambda r: r["status"] == "FIXED" and not r["already"])
+    already = count(lambda r: r["already"])
+    ready = count(lambda r: r["status"] == "OK") + applied + already
     head = f"{ready} of {n} drawing(s) ready to import."
-    items = []
 
     fix = count(lambda r: r["status"] == "FIX")
-    if fix and mode == MODE_CHECK:
-        items.append(f"{fix} need the correct .prj: run again with 'Check and fix' "
-                     f"(writes copies to the '{OUTPUT_SUBFOLDER}' subfolder).")
-    elif fix:
-        where = f"the '{OUTPUT_SUBFOLDER}' subfolder" if write_to == WRITE_COPIES else "next to the originals"
-        items.append(f"{applied} fixed in {where}: drag them into your map.")
-        not_applied = fix - applied
-        if not_applied:
-            items.append(f"{not_applied} could not be fixed: see the Fix column.")
-
+    not_applied = fix if mode == MODE_FIX else 0  # still FIX after a fix run
     nomatch_other = count(lambda r: r["review_kind"] == "nomatch" and not r["likely_local"])
     nomatch_local = count(lambda r: r["review_kind"] == "nomatch" and r["likely_local"])
-    if nomatch_other:
-        items.append(f"{nomatch_other} match no known coordinate system. If you know their system "
-                     "(for example the project ground system), add it under 'Extra coordinate systems' "
-                     "and run again. The coordinate system picker can import it from a drawing that "
-                     "checks OK or from the project's .prj. Otherwise, ask the CAD author which "
-                     "coordinate system the drawing uses.")
-    if nomatch_local:
-        items.append(f"{nomatch_local} appear to be in local or sheet coordinates. Ask the CAD author "
-                     "for a version in project coordinates, or georeference them with control points "
-                     "(not supported by this tool yet).")
     amb = count(lambda r: r["review_kind"] == "ambiguous")
-    if amb:
-        items.append(f"{amb} fit more than one system: confirm which one with the CAD author "
-                     "or the project surveyor.")
+    datum = count(lambda r: r["review_kind"] == "datum")
     stray = count(lambda r: r["stray"])
-    if stray:
-        items.append(f"{stray} have stray objects far from the drawing. They import fine, but the "
-                     "extent is too large; ask the CAD author to remove them.")
     offsite = count(lambda r: isinstance(r["offsite_layers"], int) and r["offsite_layers"] > 0)
-    if offsite:
-        items.append(f"{offsite} have CAD layers that land elsewhere: check the per-file details "
-                     "before importing those layers.")
     skip = count(lambda r: r["status"] == "SKIP")
+    where = f"the '{OUTPUT_SUBFOLDER}' subfolder" if write_to == WRITE_COPIES else "their original folders"
+
+    # The one thing to do first
+    if fix and mode == MODE_CHECK:
+        nxt = (f"Run again with 'Check and fix' to write the correct .prj for {fix} drawing(s) "
+               f"(on copies in the '{OUTPUT_SUBFOLDER}' subfolder).")
+    elif applied or already:
+        copies = f"the '{OUTPUT_SUBFOLDER}' subfolder" if already and not applied else where
+        lead = ("Fixes were already applied in an earlier run. " if already and not applied else "")
+        verb = "from" if copies != "their original folders" else "in"
+        nxt = f"{lead}Drag the {applied + already} fixed drawing(s) {verb} {copies} into your map."
+    elif nomatch_other:
+        nxt = "Add the drawings' coordinate system under 'Extra coordinate systems' and run again."
+    elif amb:
+        nxt = "Confirm the coordinate system of the drawings that fit more than one."
+    elif ready == n:
+        nxt = "Drag the drawings into your map."
+    else:
+        nxt = "See the action items below."
+
+    if added:
+        head += f" Adding {added['count']} to your map now (group '{added['group']}')."
+        if nxt.startswith(("Drag", "Fixes were already applied")):
+            nxt = (("Fixes were already applied in an earlier run. " if already and not applied else "")
+                   + "The ready drawings are being added to your map; they appear in the group "
+                   f"'{added['group']}' when the tool finishes.")
+
+    items = []
+    stale = count(lambda r: "(.prj file checked)" in r["fix"])
+    if stale:
+        items.append((f"{stale} fixed through the .prj file only (Pro had already read them in this session).",
+                      "The .prj files are correct. If those drawings land in the wrong place in this "
+                      "session, remove them from the map and restart ArcGIS Pro."))
+    if already:
+        items.append((f"{already} were already fixed in an earlier run.",
+                      f"Nothing to redo: the fixed copies are in the '{OUTPUT_SUBFOLDER}' subfolder. "
+                      f"To fix them again, delete those copies and run again."))
+    if not_applied:
+        items.append((f"{not_applied} could not be fixed or verified.",
+                      "See the Fix column for the reason, then fix and run again."))
+    if datum:
+        items.append((f"{datum} fit two versions of NAD83 on the same grid (about 1 m apart).",
+                      "The tool uses the reference's version. If the CAD author used the other "
+                      "one, positions may be off by about 1 m; fine for display, check before "
+                      "measuring."))
+    if nomatch_other:
+        items.append((f"{nomatch_other} match no known coordinate system.",
+                      "Add their system (for example the project ground system) under 'Extra "
+                      "coordinate systems' and run again. The picker can import it from a drawing "
+                      "that checks OK or from the project's .prj. Otherwise, ask the CAD author "
+                      "which system the drawing uses."))
+    if nomatch_local:
+        items.append((f"{nomatch_local} appear to be in local or sheet coordinates.",
+                      "Ask the CAD author for a version in project coordinates, or georeference "
+                      "with control points (not supported by this tool yet)."))
+    if amb:
+        items.append((f"{amb} fit more than one coordinate system.",
+                      "Confirm which one with the CAD author or the project surveyor, then add it "
+                      "under 'Extra coordinate systems' and run again."))
+    if stray:
+        items.append((f"{stray} have stray objects far from the drawing.",
+                      "They import fine, but the extent is too large. Ask the CAD author to "
+                      "remove the objects, or ignore it."))
+    if offsite:
+        items.append((f"{offsite} have CAD layers that land elsewhere.",
+                      "Check which layers in the per-file details, and leave them out when "
+                      "importing."))
     if skip:
-        items.append(f"{skip} could not be read: check that the file opens in CAD and is not locked.")
-    if not items:
-        items.append("Nothing else to do.")
-    return head, items
+        items.append((f"{skip} could not be read.",
+                      "Check that the file opens in CAD and is not locked, then run again."))
+    return head, nxt, items
 
 
 # --------------------------------------------------------------------------
 # Fix
 # --------------------------------------------------------------------------
+def copy_path(res, root):
+    """Where Copies mode puts the fixed copy of a drawing."""
+    return os.path.join(root, OUTPUT_SUBFOLDER, os.path.dirname(res["file"]),
+                        os.path.basename(res["path"]))
+
+
+def mark_existing_fix(res, root):
+    """A FIX drawing whose copy in _GIS_ready already has the right .prj was
+    fixed in an earlier run: report it as FIXED instead of fixing it again."""
+    if res["status"] != "FIX":
+        return
+    target = copy_path(res, root)
+    if not (os.path.exists(target) and os.path.exists(prj_path(target))):
+        return
+    try:
+        got = arcpy.Describe(target).spatialReference
+    except Exception:
+        return
+    if same_sr(got, res["suggested_sr"]):
+        res.update(status="FIXED", already=True, output=target,
+                   location=os.path.relpath(os.path.dirname(target), root),
+                   fix=f"Already fixed in an earlier run (copy in {OUTPUT_SUBFOLDER})")
+
+
+def write_prj(target, sr):
+    """Write the drawing's .prj with Pro's Define Projection tool, the same step
+    the GIS team does by hand, so Pro also updates what it remembers about the
+    drawing. Falls back to writing the .prj text directly."""
+    try:
+        arcpy.management.DefineProjection(target, sr)
+        if os.path.exists(prj_path(target)):
+            return
+    except Exception:
+        pass
+    with open(prj_path(target), "w", encoding="ascii") as f:
+        f.write(sr_wkt(sr))
+
+
+def verify_prj(target, sr):
+    """Check the fix: first what Pro reads for the drawing, then the .prj file
+    itself (Pro can keep an old answer for a drawing it read earlier in the run)."""
+    try:
+        if same_sr(arcpy.Describe(target).spatialReference, sr):
+            return "Applied and verified"
+    except Exception:
+        pass
+    try:
+        if same_sr(arcpy.SpatialReference(prj_path(target)), sr):
+            return "Applied and verified (.prj file checked)"
+    except Exception as e:
+        return f"Applied, could not verify: {e}"
+    return "Applied, but the .prj does not read back as intended: check manually"
+
+
+def next_backup_name(prj):
+    """drawing.prj.bak, or .prj.bak2, .bak3... so no backup is ever overwritten."""
+    candidate, i = prj + ".bak", 2
+    while os.path.exists(candidate):
+        candidate, i = f"{prj}.bak{i}", i + 1
+    return candidate
+
+
+def write_change_log(results, root):
+    """Append one block per run to _CAD_to_GIS_changes.txt in the CAD folder."""
+    changed = [r for r in results if r["fix"].startswith("Applied")]
+    if not changed:
+        return
+    try:
+        user = getpass.getuser()
+    except Exception:
+        user = "unknown"
+    lines = [f"{datetime.datetime.now():%Y-%m-%d %H:%M} | User: {user} | CAD_to_GIS.pyt v{VERSION}"]
+    for r in changed:
+        system = r["suggested_sr"].name if r["suggested_sr"] is not None else "?"
+        text = ""
+        if r["backup"]:
+            text += f"Original .prj set to {r['backup']}. "
+        if r["output"] and os.path.normcase(r["output"]) != os.path.normcase(r["path"]):
+            text += f"Copy written to {os.path.relpath(r['output'], root)}. "
+        text += (f'New .prj processed through CAD_to_GIS.pyt on "{system}" '
+                 f"coordinate reference for this project.")
+        lines.append(f"- {r['file']}: {text}")
+    log = os.path.join(root, CHANGE_LOG)
+    try:
+        new_file = not os.path.exists(log)
+        with open(log, "a", encoding="utf-8") as f:
+            if new_file:
+                f.write("CAD to GIS change log\n=====================\n")
+            f.write("\n" + "\n".join(lines) + "\n")
+        arcpy.AddMessage(f"Change log updated: {CHANGE_LOG} (in the CAD folder)")
+    except Exception as e:
+        arcpy.AddWarning(f"Could not write the change log: {e}")
+
+
+def add_ready_to_map(results, folder_name):
+    """Add OK and FIXED drawings to the active map, in one group. Returns
+    (number added, group name), or None when nothing could be added."""
+    ready = [r for r in results if r["status"] in ("OK", "FIXED")]
+    if not ready:
+        arcpy.AddMessage("No ready drawings to add to the map.")
+        return None
+    try:
+        m = arcpy.mp.ArcGISProject("CURRENT").activeMap
+    except Exception as e:
+        arcpy.AddWarning(f"Could not reach the current map: {e}")
+        return None
+    if m is None:
+        arcpy.AddWarning("No map is active (a layout may be open). Click a map view and run again "
+                         "to add the drawings.")
+        return None
+    group_name = f"CAD to GIS - {folder_name}"
+    try:
+        group = m.createGroupLayer(group_name)
+    except Exception:
+        group = None  # older Pro: add the drawings without a group
+    added = 0
+    for r in ready:
+        try:
+            lyr = m.addDataFromPath(r["output"] or r["path"])
+            if group is not None:
+                m.addLayerToGroup(group, lyr)
+                m.removeLayer(lyr)
+            added += 1
+        except Exception as e:
+            arcpy.AddWarning(f"Could not add {r['file']} to the map: {e}")
+    if added:
+        where = f"group '{group_name}'" if group is not None else "the map"
+        arcpy.AddMessage(f"Added {added} ready drawing(s) to {where} in map '{m.name}'.")
+    return (added, group_name if group is not None else m.name) if added else None
+
+
 def apply_fix(res, root, write_to):
     if res["status"] != "FIX":
         return
     sr, src = res["suggested_sr"], res["path"]
 
     if write_to == WRITE_ORIGINALS:
-        if os.path.exists(prj_path(src)):
-            res["fix"] = "Not applied: original already has a .prj (never overwritten). Use Copies mode."
-            return
         target = src
+        old_prj = prj_path(src)
+        if os.path.exists(old_prj):
+            backup = next_backup_name(old_prj)
+            res["backup_path"] = backup
+            try:
+                os.rename(old_prj, backup)
+            except Exception as e:
+                res["fix"] = f"Not applied: could not back up the existing .prj ({e})"
+                return
+            res["backup"] = os.path.basename(backup)
     else:
         out_dir = os.path.join(root, OUTPUT_SUBFOLDER, os.path.dirname(res["file"]))
         target = os.path.join(out_dir, os.path.basename(src))
         if os.path.exists(target) or os.path.exists(prj_path(target)):
-            res["fix"] = f"Not applied: a copy already exists in {OUTPUT_SUBFOLDER}. Delete it to redo."
+            res["fix"] = (f"Not applied: a copy with a different coordinate system already exists "
+                          f"in {OUTPUT_SUBFOLDER}. Delete it to redo.")
             return
         os.makedirs(out_dir, exist_ok=True)
         shutil.copy2(src, target)  # the .prj is not copied; a new one is written
+        res["location"] = os.path.relpath(out_dir, root)
 
-    with open(prj_path(target), "w", encoding="ascii") as f:
-        f.write(sr_wkt(sr))
-
-    # Confirm Pro now reads the intended coordinate system
     try:
-        arcpy.management.ClearWorkspaceCache()
-        got = arcpy.Describe(target).spatialReference
-        res["fix"] = ("Applied and verified" if same_sr(got, sr)
-                      else f"Applied, but Pro reads '{got.name}': check manually")
+        write_prj(target, sr)
     except Exception as e:
-        res["fix"] = f"Applied, could not verify: {e}"
+        res["fix"] = f"Not applied: could not write the .prj ({e})"
+        if res.get("backup_path"):  # put the original .prj back
+            try:
+                os.rename(res["backup_path"], prj_path(target))
+                res["backup"] = ""
+            except Exception:
+                pass
+        return
+
+    res["fix"] = verify_prj(target, sr)
     res["output"] = target
+    if res["fix"].startswith("Applied and verified"):
+        res["status"] = "FIXED"
 
 
 # --------------------------------------------------------------------------
@@ -711,23 +936,6 @@ def report_folder():
         return arcpy.mp.ArcGISProject("CURRENT").homeFolder
     except Exception:
         return arcpy.env.scratchFolder
-
-
-def write_csv_reports(results, layer_rows, check_layers, html_path):
-    """Optional CSV copies of the results, saved next to the HTML report."""
-    base = os.path.splitext(html_path)[0]
-    cols = ["file", "status", "detail", "existing_prj", "crs_check",
-            "crs_vs_reference", "suggested",
-            "features", "cad_layers", "offsite_layers", "fix", "output"]
-    with open(base + ".csv", "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
-        w.writeheader()
-        w.writerows(results)
-    if check_layers and layer_rows:
-        with open(base + "_layers.csv", "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=["file", "cad_layer", "features", "lands_on_site"])
-            w.writeheader()
-            w.writerows(layer_rows)
 
 
 def open_in_browser(path):
@@ -747,6 +955,7 @@ def open_in_browser(path):
 # Status colors are always paired with an icon and a text label.
 STATUS_STYLE = {
     "OK":     ("#0ca30c", "&#10003;", "OK"),
+    "FIXED":  ("#0ca30c", "&#10003;", "FIXED"),
     "FIX":    ("#fab219", "!", "FIX"),
     "REVIEW": ("#d03b3b", "?", "REVIEW"),
     "SKIP":   ("#898781", "&ndash;", "SKIP"),
@@ -792,8 +1001,11 @@ details { background:var(--surface); border:1px solid var(--rule); border-radius
           padding:8px 12px; margin:8px 0; }
 summary { cursor:pointer; font-weight:600; }
 .muted { color:var(--muted); }
-.actions { margin:8px 0 0; padding-left:20px; }
-.actions li { margin:4px 0; }
+.next { margin:8px 0 0; padding:8px 12px; border-left:4px solid #2a78d6;
+        background:rgba(42,120,214,0.08); border-radius:4px; }
+.actions { margin:12px 0 0; padding-left:20px; }
+.actions li { margin:8px 0; }
+.sol { color:var(--ink2); }
 footer { margin-top:28px; color:var(--ink2); font-size:13px; }
 code { font-family:Consolas, monospace; font-size:12.5px; }
 """
@@ -829,21 +1041,28 @@ def write_html_report(results, layer_rows, ctx):
     # Count tiles
     h.append('<div class="tiles">')
     h.append(f'<div class="tile"><div class="n">{len(results)}</div><div class="l">Files checked</div></div>')
-    for s in ("OK", "FIX", "REVIEW", "SKIP"):
+    shown = (("OK", "FIXED", "FIX", "REVIEW", "SKIP") if ctx["mode"] == MODE_FIX or counts["FIXED"]
+             else ("OK", "FIX", "REVIEW", "SKIP"))
+    for s in shown:
         zero = " zero" if counts[s] == 0 else ""
         h.append(f'<div class="tile{zero}"><div class="n">{counts[s]}</div>'
                  f'<div class="l">{_badge(s)}</div></div>')
     h.append('</div>')
 
     # Next steps: headline plus action items
-    head, items = action_items(results, ctx["mode"], ctx["write_to"])
+    head, nxt, items = action_items(results, ctx["mode"], ctx["write_to"], ctx.get("added"))
     changed = " Nothing was changed (Check only)." if ctx["mode"] == MODE_CHECK else ""
     h.append(f'<h2>Next steps</h2><div class="card"><b>{_e(head)}</b>{_e(changed)}'
-             '<ul class="actions">' + "".join(f"<li>{_e(i)}</li>" for i in items) + '</ul></div>')
+             f'<p class="next"><b>Next:</b> {_e(nxt)}</p>')
+    if items:
+        h.append('<ul class="actions">' + "".join(
+            f'<li>{_e(issue)}<br><span class="sol"><b>Solution:</b> {_e(sol)}</span></li>'
+            for issue, sol in items) + '</ul>')
+    h.append('</div>')
 
     # Results table
     h.append('<h2>Results</h2><div class="wrap"><table><thead><tr>'
-             '<th>Status</th><th>File</th><th>.prj vs reference</th><th>What was found</th>'
+             '<th>Status</th><th>File</th><th>Path</th><th>.prj vs reference</th><th>What was found</th>'
              '<th>CAD layers</th><th>Fix</th></tr></thead><tbody>')
     for r in results:
         detail, _, warning = r["detail"].partition(" | WARNING: ")
@@ -858,7 +1077,8 @@ def write_html_report(results, layer_rows, ctx):
             layers = f'{r["cad_layers"]}<br><span class="warn">{r["offsite_layers"]} elsewhere</span>'
         else:
             layers = f'{r["cad_layers"]}, all on site'
-        h.append(f'<tr><td>{_badge(r["status"])}</td><td>{_e(r["file"])}</td>'
+        h.append(f'<tr><td>{_badge(r["status"])}</td><td>{_e(os.path.basename(r["file"]))}</td>'
+                 f'<td>{_e(r["location"])}</td>'
                  f'<td>{_e(r["crs_check"] or "n/a")}</td><td>{cell}</td>'
                  f'<td>{layers}</td><td>{_e(r["fix"]) or "<span class=muted>&ndash;</span>"}</td></tr>')
     h.append('</tbody></table></div>')
@@ -909,12 +1129,22 @@ LINE_HEAVY = "=" * 60
 LINE_LIGHT = "-" * 60
 
 
-def print_header(mode, ref_layer, n_ref, ref_sr, candidates):
+def print_header(mode, cad_folder, files, ref_layer, n_ref, ref_sr, candidates):
     """Run header. Shows names only, not full paths."""
     main, params = describe_sr(ref_sr)
+    by_ext = {}
+    for f in files:
+        e = os.path.splitext(f)[1].lower()
+        by_ext[e] = by_ext.get(e, 0) + 1
+    n_dirs = len({os.path.dirname(f) for f in files})
+    folder_name = os.path.basename(cad_folder.rstrip("\\/"))
     arcpy.AddMessage(LINE_HEAVY)
     arcpy.AddMessage(f" CAD to GIS v{VERSION}  |  {mode}")
     arcpy.AddMessage(LINE_HEAVY)
+    arcpy.AddMessage("CAD folder")
+    arcpy.AddMessage(f"  {folder_name}: {len(files)} file(s) ("
+                     + ", ".join(f"{n} {e}" for e, n in sorted(by_ext.items()))
+                     + f") in {n_dirs} folder(s)")
     arcpy.AddMessage("Reference")
     arcpy.AddMessage(f"  Layer:   {os.path.basename(ref_layer)}  ({n_ref} feature(s))")
     arcpy.AddMessage(f"  System:  {ref_sr.name}")
@@ -926,11 +1156,11 @@ def print_header(mode, ref_layer, n_ref, ref_sr, candidates):
         arcpy.AddMessage(f"  - {label}")
 
 
-def print_summary(results, mode, write_to, report_path, seconds):
+def print_summary(results, mode, write_to, report_path, seconds, added=None):
     counts = {}
     for r in results:
         counts[r["status"]] = counts.get(r["status"], 0) + 1
-    tally = "  |  ".join(f"{counts[s]} {s}" for s in ("OK", "FIX", "REVIEW", "SKIP") if counts.get(s))
+    tally = "  |  ".join(f"{counts[s]} {s}" for s in ("OK", "FIXED", "FIX", "REVIEW", "SKIP") if counts.get(s))
     arcpy.AddMessage(LINE_LIGHT)
     arcpy.AddMessage(f"Results: {len(results)} file(s)  |  {tally}")
     arcpy.AddMessage(LINE_LIGHT)
@@ -951,18 +1181,22 @@ def print_summary(results, mode, write_to, report_path, seconds):
         if r["fix"]:
             lines.append(f"      Fix: {r['fix']}")
         text = "\n".join(lines)
-        if r["status"] == "OK" and not warning:
+        if r["status"] in ("OK", "FIXED") and not warning:
             arcpy.AddMessage(text)
         else:
             arcpy.AddWarning(text)
         arcpy.AddMessage("")
 
     arcpy.AddMessage(LINE_LIGHT)
-    head, items = action_items(results, mode, write_to)
-    arcpy.AddMessage(head + ("  Check only: nothing was changed." if mode == MODE_CHECK else ""))
-    arcpy.AddMessage("Action items:")
-    for item in items:
-        arcpy.AddMessage(f"  - {item}")
+    head, nxt, items = action_items(results, mode, write_to, added)
+    arcpy.AddMessage(head + ("  Nothing was changed (Check only)." if mode == MODE_CHECK else ""))
+    arcpy.AddMessage(f"NEXT: {nxt}")
+    if items:
+        arcpy.AddMessage("")
+        arcpy.AddMessage("Action items:")
+        for issue, solution in items:
+            arcpy.AddMessage(f"  - {issue}")
+            arcpy.AddMessage(f"      Solution: {solution}")
     arcpy.AddMessage("")
     arcpy.AddMessage(f"Report:  {os.path.basename(report_path)}  (in the Pro project folder)")
     arcpy.AddMessage("         Click the link above, under 'Report', to open it again.")
