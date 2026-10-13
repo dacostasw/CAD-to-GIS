@@ -2,6 +2,7 @@
 """
 CAD to GIS (v0.1.10) - ArcGIS Pro Python toolbox.
 Date: 2026-10-12
+-- Test phase --
 Designed for ArcGIS Pro 3.0+ (Python 3.9+). See README.md for installation and usage.
 
 Checks the CAD drawings in a folder against a reference layer that is known to
@@ -49,7 +50,7 @@ MODE_FIX = "Check and fix"
 WRITE_COPIES = "Copies in _GIS_ready subfolder"
 WRITE_ORIGINALS = "Original folders (adds a .prj next to each drawing)"
 CHANGE_LOG = "_CAD_to_GIS_changes.txt"
-DONE_OPEN_REPORT = "Open the report in my browser"
+DONE_OPEN_REPORT = "Generate report and open in browser"
 DONE_ADD_TO_MAP = "Add ready drawings to the current map"
 
 
@@ -99,7 +100,7 @@ class CheckCADCoordinates:
         write_to.enabled = False
 
         layers = arcpy.Parameter(
-            displayName="Check each CAD layer (finds parts of combined drawings that land elsewhere)",
+            displayName="Check each CAD layer (finds parts of combined drawings)",
             name="check_layers", datatype="GPBoolean",
             parameterType="Optional", direction="Input")
         layers.value = True
@@ -117,7 +118,7 @@ class CheckCADCoordinates:
             parameterType="Optional", direction="Input", multiValue=True)
 
         when_done = arcpy.Parameter(
-            displayName="When done", name="when_done", datatype="GPString",
+            displayName="Output options", name="when_done", datatype="GPString",
             parameterType="Optional", direction="Input", multiValue=True)
         when_done.filter.type = "ValueList"
         when_done.filter.list = [DONE_OPEN_REPORT, DONE_ADD_TO_MAP]
