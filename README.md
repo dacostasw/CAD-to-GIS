@@ -10,7 +10,7 @@ An ArcGIS Pro tool that checks a folder of CAD drawings against a project's refe
 
 ## Purpose
  
-Bringing CAD drawings into ArcGIS Pro often puts them in the wrong place. The usual cause is that a drawing has no coordinate system assigned, or the wrong one. Fixing it by hand ("assign coordinate system" → "validate position") takes about **20 minutes per file**, and project folders can hold dozens of drawings whose coordinate system are unknown. This tool  This tool works out which `.prj` each drawing `.dwg` needs by checking where it lands relative to known project dataa, a process 30x times faster than by hand.
+Bringing CAD drawings into ArcGIS Pro often puts them in the wrong place. The usual cause is that a drawing has no coordinate system assigned, or the wrong one. Fixing it by hand ("assign coordinate system" → "validate position") takes about **20 minutes per file**, and project folders can hold dozens of drawings whose coordinate system are unknown. This tool works out which `.prj` each drawing `.dwg` needs by checking where it lands relative to known project dataa, a process 30x times faster than by hand.
 
 ## Workflow
 
