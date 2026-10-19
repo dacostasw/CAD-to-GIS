@@ -50,7 +50,7 @@ MODE_FIX = "Check and fix"
 WRITE_COPIES = "Copies in _GIS_ready subfolder"
 WRITE_ORIGINALS = "Original folders (adds a .prj next to each drawing)"
 CHANGE_LOG = "_CAD_to_GIS_changes.txt"
-DONE_OPEN_REPORT = "Generate report and open in browser"
+DONE_OPEN_REPORT = "Open the report in my browser"
 DONE_ADD_TO_MAP = "Add ready drawings to the current map"
 
 
@@ -100,7 +100,7 @@ class CheckCADCoordinates:
         write_to.enabled = False
 
         layers = arcpy.Parameter(
-            displayName="Check each CAD layer (finds parts of combined drawings)",
+            displayName="Check each CAD layer (finds parts of combined drawings that land elsewhere)",
             name="check_layers", datatype="GPBoolean",
             parameterType="Optional", direction="Input")
         layers.value = True
